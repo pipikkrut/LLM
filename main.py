@@ -300,14 +300,14 @@ def generate_text(model, prompt, max_new_tokens=200, temperature=0.8, top_k=40, 
 def run_generate(prompt):
     model = Network().to(DEVICE)
     model.load_state_dict(torch.load(BEST_CKPT, map_location=DEVICE, weights_only=True))
-    print(generate_text(model, prompt, max_new_tokens=200))
+    print(generate_text(model, prompt, max_new_tokens=100, temperature=1))
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "train"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "generate"
     if mode == "train":
         train()
     elif mode == "generate":
-        run_generate(sys.argv[2] if len(sys.argv) > 2 else "Москва")
+        run_generate(sys.argv[2] if len(sys.argv) > 2 else "Привет")
     else:
         print("Использование: python main.py train | python main.py generate \"текст\"")
