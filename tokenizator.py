@@ -1,4 +1,3 @@
-
 import json
 import numpy as np
 
@@ -29,7 +28,7 @@ VAL_BIN = Path("data/mixed_val.bin")
 
 VOCAB_SIZE = CONFIG["VOCAB_SIZE"]
 
-# Общий лимит — 150 млн токенов
+# Общий лимит — 300 млн токенов
 MAX_TOKENS = {
     "fineweb": 240_000_000,
     "wiki": 60_000_000
@@ -38,7 +37,8 @@ MAX_TOKENS = {
 TOKENIZER_SAMPLE_CHARS = 400_000_000
 
 CHUNK_DOCS = 1000
-VAL_EVERY = 200
+# 199 взаимно просто с 5 (цикл 4 FineWeb + 1 Wiki): иначе в val попадал бы только FineWeb
+VAL_EVERY = 199
 
 SPECIAL_TOKENS = [
     "[UNK]",
@@ -296,7 +296,7 @@ def tokenize_corpus(tokenizer):
                     f"Documents: {total_docs:,} | "
                     f"FineWeb: {written['fineweb']:,} | "
                     f"Wiki: {written['wiki']:,} | "
-                    f"Total: {total_tokens:,} / {MAX_TOKENS["fineweb"] + MAX_TOKENS["wiki"]}"
+                    f"Total: {total_tokens:,} / {sum(MAX_TOKENS.values()):,}"
                 )
 
         flush()
@@ -336,9 +336,9 @@ def main():
 
     print("Mixed dataset: FineWeb + Wikipedia")
 
-    print("FineWeb target: 120M tokens")
-    print("Wikipedia target: 30M tokens")
-    print("Total target: 150M tokens")
+    print(f"FineWeb target: {MAX_TOKENS['fineweb'] / 1e6:.0f}M tokens")
+    print(f"Wikipedia target: {MAX_TOKENS['wiki'] / 1e6:.0f}M tokens")
+    print(f"Total target: {sum(MAX_TOKENS.values()) / 1e6:.0f}M tokens")
 
     tokenizer = load_tokenizer()
 

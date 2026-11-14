@@ -135,13 +135,23 @@ class Network(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, ids, max_new_tokens=200, temperature=0.8, top_k=40, top_p=0.95):
+    def generate(self, ids, max_new_tokens=200, temperature=0.8, top_k=40, top_p=0.95,
+                 repetition_penalty=1.2):
         self.eval()
         for _ in range(max_new_tokens):
             window = ids[:, -BLOCK_SIZE:]
             with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=USE_AMP):
                 logits, _ = self(window)
-            logits = logits[:, -1, :].float() / max(temperature, 1e-5)
+            logits = logits[:, -1, :].float()
+
+            # штраф за повторы: токены из последних 128 становятся менее вероятными
+            if repetition_penalty != 1.0:
+                recent = torch.unique(ids[0, -128:])
+                vals = logits[0, recent]
+                logits[0, recent] = torch.where(vals > 0, vals / repetition_penalty,
+                                                vals * repetition_penalty)
+
+            logits = logits / max(temperature, 1e-5)
 
             if top_k:
                 kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1, None]
@@ -280,8 +290,10 @@ def train():
                   f"| ppl {math.exp(losses['val']):.1f}{' | новый лучший' if is_best else ''} ===")
             save_checkpoints(model, optimizer, scaler, step, best_val, is_best)
 
-            sample = generate_text(model, "Москва — ", max_new_tokens=60)
-            print("Пример:", sample.replace("\n", " "), "\n")
+            for prompt in ("Москва — это", "Привет! Как", "В 1990 году"):  # без пробела в конце
+                sample = generate_text(model, prompt, max_new_tokens=60)
+                print("Пример:", sample.replace("\n", " "))
+            print()
             model.train()
             t0 = time.time()
             tokens_since = 0
@@ -290,21 +302,22 @@ def train():
 
 
 # ---------- генерация ----------
-def generate_text(model, prompt, max_new_tokens=200, temperature=0.8, top_k=40, top_p=0.95):
+def generate_text(model, prompt, max_new_tokens=200, temperature=0.8, top_k=40, top_p=0.95,
+                  repetition_penalty=1.2):
     tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
     ids = torch.tensor([tokenizer.encode(prompt).ids], dtype=torch.long, device=DEVICE)
-    out = model.generate(ids, max_new_tokens, temperature, top_k, top_p)
+    out = model.generate(ids, max_new_tokens, temperature, top_k, top_p, repetition_penalty)
     return tokenizer.decode(out[0].tolist())
 
 
 def run_generate(prompt):
     model = Network().to(DEVICE)
     model.load_state_dict(torch.load(BEST_CKPT, map_location=DEVICE, weights_only=True))
-    print(generate_text(model, prompt, max_new_tokens=100, temperature=1))
+    print(generate_text(model, prompt, max_new_tokens=150, temperature=0.8))
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "generate"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "train"
     if mode == "train":
         train()
     elif mode == "generate":

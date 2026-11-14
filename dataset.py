@@ -1,4 +1,3 @@
-
 import json
 import re
 import unicodedata
@@ -84,6 +83,13 @@ CATEGORY_LINE = re.compile(
 
 INITIALS = re.compile(
     r"\b[А-ЯЁ]\."
+)
+
+# Заголовки хвоста статьи: после них идут только списки литературы и ссылок
+TAIL_SECTION = re.compile(
+    r"^(примечания|примечания и ссылки|примечания и источники|литература|ссылки|"
+    r"внешние ссылки|источники|см\. также|библиография)\s*:?$",
+    re.IGNORECASE
 )
 
 
@@ -230,7 +236,11 @@ def filter_text(text):
 
         line = line.strip()
 
+        if TAIL_SECTION.match(line):
+            break
+
         if not line:
+            output.append("")  # сохраняем границы абзацев
             continue
 
         cleaned = filter_line(line)
