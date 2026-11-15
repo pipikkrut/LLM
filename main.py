@@ -1,12 +1,16 @@
+import contextlib
 import math
+import os
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tokenizers import Tokenizer
 
 from config import CONFIG
@@ -41,7 +45,18 @@ CKPT_DIR = Path(CONFIG["CKPT_DIR"])
 LAST_CKPT = CKPT_DIR / "ckpt_last.pt"   # веса + оптимизатор + шаг (для продолжения)
 BEST_CKPT = CKPT_DIR / "model_best.pt"  # только веса лучшей модели по val loss
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---------- несколько GPU (запуск через torchrun) ----------
+DDP_ON = "RANK" in os.environ
+RANK = int(os.environ.get("RANK", 0))
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+IS_MAIN = RANK == 0
+
+if torch.cuda.is_available():
+    DEVICE = torch.device(f"cuda:{LOCAL_RANK}")
+    torch.cuda.set_device(DEVICE)
+else:
+    DEVICE = torch.device("cpu")
 USE_AMP = DEVICE.type == "cuda"
 EOS_ID = 3  # проверяется в prepare_data.py
 
@@ -229,24 +244,45 @@ def save_checkpoints(model, optimizer, scaler, step, best_val, is_best):
         torch.save(model.state_dict(), BEST_CKPT)
 
 
+def reduce_mean(value):
+    """Среднее значение по всем GPU (чтобы val loss был одинаковым на всех процессах)."""
+    if not DDP_ON:
+        return value
+    t = torch.tensor(value, device=DEVICE)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return (t / WORLD_SIZE).item()
+
+
 def train():
-    model = Network().to(DEVICE)
-    optimizer = build_optimizer(model)
+    if DDP_ON:
+        dist.init_process_group(backend="nccl" if USE_AMP else "gloo")
+    torch.manual_seed(1337)
+    np.random.seed(1337 + RANK)  # у каждой GPU свои случайные окна данных
+
+    raw_model = Network().to(DEVICE)
+    optimizer = build_optimizer(raw_model)
     scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
-    n_params = sum(p.numel() for p in model.parameters())
-    tokens_per_step = BATCH_SIZE * BLOCK_SIZE * GRAD_ACCUM
-    print(f"Параметров: {n_params / 1e6:.1f}M | токенов за шаг: {tokens_per_step:,} "
-          f"| всего токенов: {tokens_per_step * MAX_STEPS / 1e6:.0f}M | устройство: {DEVICE}")
+    assert GRAD_ACCUM % WORLD_SIZE == 0, "GRAD_ACCUM должен делиться на число GPU"
+    accum = GRAD_ACCUM // WORLD_SIZE                          # микрошагов на одну GPU
+    tokens_per_step = BATCH_SIZE * BLOCK_SIZE * GRAD_ACCUM    # токенов за шаг суммарно по всем GPU
+
+    if IS_MAIN:
+        n_params = sum(p.numel() for p in raw_model.parameters())
+        print(f"Параметров: {n_params / 1e6:.1f}M | GPU: {WORLD_SIZE} | токенов за шаг: {tokens_per_step:,} "
+              f"| всего токенов: {tokens_per_step * MAX_STEPS / 1e6:.0f}M | устройство: {DEVICE}")
 
     step, best_val = 0, float("inf")
     if LAST_CKPT.exists():
         ckpt = torch.load(LAST_CKPT, map_location=DEVICE, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
         step, best_val = ckpt["step"], ckpt["best_val"]
-        print(f"Продолжаем с шага {step}, лучший val loss: {best_val:.4f}")
+        if IS_MAIN:
+            print(f"Продолжаем с шага {step}, лучший val loss: {best_val:.4f}")
+
+    model = DDP(raw_model, device_ids=[LOCAL_RANK] if USE_AMP else None) if DDP_ON else raw_model
 
     model.train()
     t0 = time.time()
@@ -259,15 +295,18 @@ def train():
             g["lr"] = lr
 
         optimizer.zero_grad(set_to_none=True)
-        for _ in range(GRAD_ACCUM):
+        for micro in range(accum):
             x, y = get_batch("train")
-            with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=USE_AMP):
-                _, loss = model(x, y)
-            scaler.scale(loss / GRAD_ACCUM).backward()
-            running_loss += loss.item() / GRAD_ACCUM
+            # градиенты между GPU синхронизируем только на последнем микрошаге
+            skip_sync = DDP_ON and micro < accum - 1
+            with (model.no_sync() if skip_sync else contextlib.nullcontext()):
+                with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=USE_AMP):
+                    _, loss = model(x, y)
+                scaler.scale(loss / accum).backward()
+            running_loss += loss.item() / accum
 
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
 
@@ -278,27 +317,36 @@ def train():
             dt = time.time() - t0
             speed = tokens_since / dt
             eta_min = (MAX_STEPS - step) * tokens_per_step / speed / 60
-            print(f"шаг {step}/{MAX_STEPS} | loss {running_loss / LOG_INTERVAL:.4f} "
-                  f"| lr {lr:.2e} | {speed:,.0f} ток/с | осталось ~{eta_min:.0f} мин")
+            if IS_MAIN:
+                print(f"шаг {step}/{MAX_STEPS} | loss {running_loss / LOG_INTERVAL:.4f} "
+                      f"| lr {lr:.2e} | {speed:,.0f} ток/с | осталось ~{eta_min:.0f} мин")
             running_loss, tokens_since, t0 = 0.0, 0, time.time()
 
         if step % EVAL_INTERVAL == 0 or step == MAX_STEPS:
-            losses = estimate_loss(model)
+            losses = {k: reduce_mean(v) for k, v in estimate_loss(raw_model).items()}
             is_best = losses["val"] < best_val
             best_val = min(best_val, losses["val"])
-            print(f"\n=== шаг {step} | train {losses['train']:.4f} | val {losses['val']:.4f} "
-                  f"| ppl {math.exp(losses['val']):.1f}{' | новый лучший' if is_best else ''} ===")
-            save_checkpoints(model, optimizer, scaler, step, best_val, is_best)
 
-            for prompt in ("Москва — это", "Привет! Как", "В 1990 году"):  # без пробела в конце
-                sample = generate_text(model, prompt, max_new_tokens=60)
-                print("Пример:", sample.replace("\n", " "))
-            print()
+            if IS_MAIN:
+                print(f"\n=== шаг {step} | train {losses['train']:.4f} | val {losses['val']:.4f} "
+                      f"| ppl {math.exp(losses['val']):.1f}{' | новый лучший' if is_best else ''} ===")
+                save_checkpoints(raw_model, optimizer, scaler, step, best_val, is_best)
+
+                for prompt in ("Москва — это", "Привет! Как", "В 1990 году"):  # без пробела в конце
+                    sample = generate_text(raw_model, prompt, max_new_tokens=60)
+                    print("Пример:", sample.replace("\n", " "))
+                print()
+
+            if DDP_ON:
+                dist.barrier()  # остальные GPU ждут, пока главный процесс сохранит чекпоинт
             model.train()
             t0 = time.time()
             tokens_since = 0
 
-    print("Обучение завершено.")
+    if IS_MAIN:
+        print("Обучение завершено.")
+    if DDP_ON:
+        dist.destroy_process_group()
 
 
 # ---------- генерация ----------
