@@ -33,6 +33,7 @@ WEIGHT_DECAY = CONFIG["WEIGHT_DECAY"]
 EVAL_INTERVAL = CONFIG["EVAL_INTERVAL"]
 EVAL_ITERS = CONFIG["EVAL_ITERS"]
 LOG_INTERVAL = CONFIG["LOG_INTERVAL"]
+COMPILE = CONFIG.get("COMPILE", False)  # torch.compile: ускоряет, но первые шаги долгие
 
 HEAD_DIM = EMBEDDING_DIM // N_HEAD
 assert EMBEDDING_DIM % N_HEAD == 0
@@ -72,11 +73,9 @@ def get_batch(split):
     data = _data_cache[split]
 
     ix = np.random.randint(0, len(data) - BLOCK_SIZE - 1, (BATCH_SIZE,))
-    x = torch.stack([torch.from_numpy(data[i:i + BLOCK_SIZE].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[i + 1:i + 1 + BLOCK_SIZE].astype(np.int64)) for i in ix])
-
-    if USE_AMP:
-        return x.pin_memory().to(DEVICE, non_blocking=True), y.pin_memory().to(DEVICE, non_blocking=True)
+    idx = ix[:, None] + np.arange(BLOCK_SIZE)[None, :]   # все окна за одну операцию
+    x = torch.from_numpy(data[idx].astype(np.int64))
+    y = torch.from_numpy(data[idx + 1].astype(np.int64))
     return x.to(DEVICE), y.to(DEVICE)
 
 
@@ -201,6 +200,7 @@ def build_optimizer(model):
         [{"params": decay, "weight_decay": WEIGHT_DECAY},
          {"params": no_decay, "weight_decay": 0.0}],
         lr=LEARNING_RATE, betas=(0.9, 0.95),
+        fused=USE_AMP,  # быстрая версия AdamW для GPU
     )
 
 
@@ -283,11 +283,13 @@ def train():
             print(f"Продолжаем с шага {step}, лучший val loss: {best_val:.4f}")
 
     model = DDP(raw_model, device_ids=[LOCAL_RANK] if USE_AMP else None) if DDP_ON else raw_model
+    if COMPILE:
+        model = torch.compile(model)  # оценка и генерация идут через raw_model, поэтому не перекомпилируются
 
     model.train()
     t0 = time.time()
     tokens_since = 0
-    running_loss = 0.0
+    running_loss = torch.zeros((), device=DEVICE)  # копим лосс на GPU, без синхронизации на каждом шаге
 
     while step < MAX_STEPS:
         lr = get_lr(step)
@@ -303,7 +305,7 @@ def train():
                 with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=USE_AMP):
                     _, loss = model(x, y)
                 scaler.scale(loss / accum).backward()
-            running_loss += loss.item() / accum
+            running_loss += loss.detach() / accum
 
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
@@ -318,9 +320,10 @@ def train():
             speed = tokens_since / dt
             eta_min = (MAX_STEPS - step) * tokens_per_step / speed / 60
             if IS_MAIN:
-                print(f"шаг {step}/{MAX_STEPS} | loss {running_loss / LOG_INTERVAL:.4f} "
+                print(f"шаг {step}/{MAX_STEPS} | loss {running_loss.item() / LOG_INTERVAL:.4f} "
                       f"| lr {lr:.2e} | {speed:,.0f} ток/с | осталось ~{eta_min:.0f} мин")
-            running_loss, tokens_since, t0 = 0.0, 0, time.time()
+            running_loss.zero_()
+            tokens_since, t0 = 0, time.time()
 
         if step % EVAL_INTERVAL == 0 or step == MAX_STEPS:
             losses = {k: reduce_mean(v) for k, v in estimate_loss(raw_model).items()}
@@ -365,7 +368,7 @@ def run_generate(prompt):
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "train"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "generate"
     if mode == "train":
         train()
     elif mode == "generate":
